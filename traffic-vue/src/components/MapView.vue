@@ -44,10 +44,9 @@ onMounted(() => {
   AMapLoader.load({
     key: '4fe176fc16d356769714d97913538dce',
     version: '2.0',
-    plugins: ['AMap.Scale', 'AMap.ToolBar', 'AMap.PlaceSearch']
+    plugins: ['AMap.Scale', 'AMap.ToolBar']
   }).then((_AMap) => {
     AMap = _AMap;
-    // ----- 1. 创建地图（底图载入）-----
     map = new AMap.Map('map-container', {
       viewMode: '2D',
       zoom: 12,
@@ -55,59 +54,24 @@ onMounted(() => {
     });
     map.addControl(new AMap.Scale());
     map.addControl(new AMap.ToolBar());
-    setTimeout(() => map.resize(), 100);
-    setTimeout(() => map.resize(), 500);
-
-    // ----- 2. POI搜索真实工厂并自动入库（无按钮）-----
-    const placeSearch = new AMap.PlaceSearch({
-      type: '工厂',
-      city: '成都',
-      pageSize:0,
-      pageIndex: 1
-    });
-
-    placeSearch.search('工厂', (status, result) => {
-      if (status === 'complete' && result.poiList) {
-        const pois = result.poiList.pois;
-        console.log(`搜索到 ${pois.length} 个工厂，开始自动入库...`);
-        
-        pois.forEach((poi, index) => {
-          const factoryData = {
-            factoryName: poi.name,
-            address: poi.address || '',
-            phone: '',
-            factoryLongitude: poi.location.lng,
-            factoryLatitude: poi.location.lat,
-            needId: 1
-          };
-
-          // 注意：这是相对路径 /api/...，而非 localhost:8080
-          fetch('/factories', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(factoryData)
-          })
-          .then(res => res.text())
-          .then(msg => console.log(`第${index+1}个入库成功:`, poi.name))
-          .catch(err => console.error(`第${index+1}个入库失败:`, err));
-        });
-      } else {
-        console.warn('POI搜索无结果或失败', status);
-      }
-    });
-
-    // ----- 3. 加载已入库工厂到地图显示-----
+    
+    // 延迟 resize 确保地图容器渲染完毕
+    setTimeout(() => map.resize(), 200);
+    
+    // 加载工厂
     loadFactories();
+    // 加载车辆列表
+    loadVehicles();
   }).catch(e => {
-    console.error('高德地图加载失败', e);
+    console.error('高德地图加载失败:', e);
   });
 });
 
-// ----- 加载已入库工厂并在地图上打点 -----
 function loadFactories() {
   fetch('/factories')
     .then(r => r.json())
     .then(data => {
+      console.log('工厂数据:', data);
       data.forEach(f => {
         const marker = new AMap.Marker({
           position: [f.factoryLongitude, f.factoryLatitude],
@@ -118,18 +82,61 @@ function loadFactories() {
       });
       if (data.length) map.setFitView();
     })
-    .catch(err => console.error('加载工厂失败', err));
+    .catch(err => console.error('加载工厂失败:', err));
 }
 
-// ----- 新增：加载车辆列表 -----
 function loadVehicles() {
   fetch('/vehicles')
-    .then(r => r.json())
-    .then(data => { vehicles.value = data; })
-    .catch(err => console.error('加载车辆失败', err));
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const ct = r.headers.get('content-type');
+      if (ct && !ct.includes('application/json')) {
+        throw new Error('返回非JSON，请检查后端/代理');
+      }
+      return r.json();
+    })
+    .then(data => {
+      console.log('车辆数据:', data);
+      
+      // 新增：用于收集有效车辆数据，供左侧列表使用
+      const validVehicles = [];
+      
+      data.forEach(v => {
+        console.log('车辆原始数据:', v);
+
+        const lng = Number(v.currentLongitude);
+        const lat = Number(v.currentLatitude);
+
+        if (isNaN(lng) || isNaN(lat)) {
+          console.warn('跳过无效坐标车辆:', v.id);
+          return;
+        }
+
+        // 地图标记（保持原有代码不变）
+        const marker = new AMap.Marker({
+          position: [lng, lat],
+          zIndex: 999,
+          content: `<div style="background:#d9534f;color:white;padding:2px 8px;border-radius:12px;font-size:12px;box-shadow:0 2px 4px rgba(0,0,0,0.3);">🚗${v.id}</div>`,
+          offset: new AMap.Pixel(-20, -10)
+        });
+        marker.setMap(map);
+
+        // 新增：收集有效车辆数据
+        validVehicles.push({
+          id: v.id || v.bandName,
+          currentAction: v.currentAction || 1,
+          remainingTime: v.remainingTime || 0
+        });
+      });
+
+      // 新增：更新左侧列表
+      vehicles.value = validVehicles;
+
+      if (data.length) map.setFitView();
+    })
+    .catch(err => console.error('加载车辆失败:', err));
 }
 
-// ----- 新增：马表控制 -----
 function startSim() {
   fetch('/sim/start', { method: 'POST' });
   loadVehicles();
