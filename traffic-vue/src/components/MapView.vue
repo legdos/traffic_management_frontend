@@ -189,6 +189,7 @@ async function loadFactories() {
   const list = await response.json()
   factories.value = list
 
+  const factoryMarkers = []
   list.forEach((f) => {
     const lng = Number(f.factoryLongitude)
     const lat = Number(f.factoryLatitude)
@@ -206,7 +207,13 @@ async function loadFactories() {
       zIndex: 50,
     })
     dot.setMap(map)
+    factoryMarkers.push(dot)
   })
+
+  // 初始视野自适应到全部工厂，否则 zoom=12 只能看到十来个点位
+  if (factoryMarkers.length && map) {
+    map.setFitView(factoryMarkers, false, [60, 60, 60, 60], 11)
+  }
 }
 
 async function loadState() {
@@ -224,9 +231,6 @@ async function loadState() {
 
     renderVehicles(state.vehicles)
     renderTasks(state.activeMissions)
-    if (state.tick === 1 && map) {
-      map.setFitView()
-    }
   } catch (e) {
     errorMsg.value = `获取仿真状态失败：${e.message}（后端是否已启动？）`
   }
