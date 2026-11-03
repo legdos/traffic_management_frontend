@@ -12,6 +12,9 @@
       <button :disabled="state.running" @click="run(startSim)">启动仿真</button>
       <button :disabled="!state.running" @click="run(stopSim)">停止</button>
       <button class="ghost" @click="run(resetSim)">重置</button>
+      <button class="ghost" :disabled="importing" @click="importFactoriesFromAmap">
+        {{ importing ? '抓取中…' : '抓取真实工厂' }}
+      </button>
     </div>
 
     <VehiclePanel :vehicles="state.vehicles" :missions="state.activeMissions" :factories="factories" />
@@ -23,13 +26,23 @@
     />
 
     <div v-if="errorMsg" class="toast">{{ errorMsg }}</div>
+    <div v-if="notice" class="toast info">{{ notice }}</div>
   </div>
 </template>
 
 <script setup>
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { fetchRoute, fetchRoutePoints, fetchState, resetSim, startSim, stopSim, updateRoutePoints } from '../api/sim'
+import {
+  fetchRoute,
+  fetchRoutePoints,
+  fetchState,
+  resetSim,
+  startSim,
+  stopSim,
+  updatePickupPoints,
+  updateRoutePoints,
+} from '../api/sim'
 import VehiclePanel from './VehiclePanel.vue'
 import TaskPanel from './TaskPanel.vue'
 
@@ -70,6 +83,8 @@ const state = reactive({
 
 const factories = ref([])
 const errorMsg = ref('')
+const notice = ref('')
+const importing = ref(false)
 
 let map = null
 let AMap = null
@@ -77,9 +92,12 @@ let pollTimer = null
 
 const factoryById = new Map()
 const vehicleMarkers = new Map()
-const taskLines = new Map()
+/** 工厂点位标记，重新导入工厂时需要整体清掉 */
+const factoryMarkers = []
 /** 每辆车的动画状态：当前插值位置 + 目标位置 */
 const markerState = new Map()
+/** 已规划过取货路线的「车辆:任务」，避免重复请求 */
+const pickupPlanned = new Set()
 let rafId = null
 let lastFrame = 0
 /** 路线折线缓存：routeId -> [[lng,lat],...] */
@@ -130,8 +148,9 @@ onUnmounted(() => {
   }
   factoryById.clear()
   vehicleMarkers.clear()
-  taskLines.clear()
+  factoryMarkers.length = 0
   markerState.clear()
+  pickupPlanned.clear()
   routeCache.clear()
   routeLoading.clear()
 })
@@ -189,7 +208,7 @@ async function loadFactories() {
   const list = await response.json()
   factories.value = list
 
-  const factoryMarkers = []
+  const markers = []
   list.forEach((f) => {
     const lng = Number(f.factoryLongitude)
     const lat = Number(f.factoryLatitude)
@@ -207,12 +226,14 @@ async function loadFactories() {
       zIndex: 50,
     })
     dot.setMap(map)
-    factoryMarkers.push(dot)
+    markers.push(dot)
   })
 
+  factoryMarkers.push(...markers)
+
   // 初始视野自适应到全部工厂，否则 zoom=12 只能看到十来个点位
-  if (factoryMarkers.length && map) {
-    map.setFitView(factoryMarkers, false, [60, 60, 60, 60], 11)
+  if (markers.length && map) {
+    map.setFitView(markers, false, [60, 60, 60, 60], 11)
   }
 }
 
@@ -230,7 +251,8 @@ async function loadState() {
     errorMsg.value = ''
 
     renderVehicles(state.vehicles)
-    renderTasks(state.activeMissions)
+    planTaskRoutes(state.activeMissions)
+    planPickupRoutes(state.vehicles, state.activeMissions)
   } catch (e) {
     errorMsg.value = `获取仿真状态失败：${e.message}（后端是否已启动？）`
   }
@@ -309,55 +331,55 @@ function renderVehicles(vehicles) {
   })
 }
 
-/** 进行中的任务按数据库里的路线折线绘制；路线还没取到就先画直线占位 */
-function renderTasks(missions) {
-  const alive = new Set()
+/** 任务路线只用于规划几何（供后端推进车辆），不再在地图上画线 */
+function planTaskRoutes(missions) {
   missions.forEach((m) => {
     const from = factoryById.get(m.factoryId)
     const to = factoryById.get(m.destFactoryId)
-    if (!from || !to) {
+    if (!from || !to || !m.routeId) {
       return
     }
-    alive.add(m.id)
-    drawTaskLine(m, from, to)
-  })
-
-  taskLines.forEach((line, id) => {
-    if (!alive.has(id)) {
-      line.setMap(null)
-      taskLines.delete(id)
-    }
+    ensureRouteGeometry(m.routeId, from, to).catch(() => {})
   })
 }
 
-async function drawTaskLine(mission, from, to) {
-  let path = [
-    [from.lng, from.lat],
-    [to.lng, to.lat],
-  ]
-  if (mission.routeId) {
-    const points = await ensureRouteGeometry(mission.routeId, from, to)
-    if (points && points.length > 1) {
-      path = points
+/** 接单行驶段也要走真实道路：规划「车辆当前位置 → 装货工厂」并回写给后端 */
+function planPickupRoutes(vehicles, missions) {
+  const missionByCar = new Map()
+  missions.forEach((m) => {
+    if (m.carId) {
+      missionByCar.set(m.carId, m)
     }
-  }
-  if (!map) {
-    return
-  }
-  const line = taskLines.get(mission.id)
-  if (!line) {
-    const created = new AMap.Polyline({
-      path,
-      strokeColor: '#409EFF',
-      strokeWeight: 4,
-      strokeOpacity: 0.85,
-      zIndex: 120,
-    })
-    created.setMap(map)
-    taskLines.set(mission.id, created)
-  } else {
-    line.setPath(path)
-  }
+  })
+
+  vehicles.forEach((v) => {
+    // 2 = 接单行驶
+    if (Number(v.currentAction) !== 2) {
+      return
+    }
+    const mission = missionByCar.get(v.id)
+    const target = mission ? factoryById.get(mission.factoryId) : null
+    if (!mission || !target) {
+      return
+    }
+    const key = `${v.id}:${mission.id}`
+    if (pickupPlanned.has(key)) {
+      return
+    }
+    const from = { lng: Number(v.currentLongitude), lat: Number(v.currentLatitude) }
+    if (!Number.isFinite(from.lng) || !Number.isFinite(from.lat)) {
+      return
+    }
+    pickupPlanned.add(key)
+    planRoute(from, target)
+      .then((points) => {
+        if (points && points.length > 1) {
+          return updatePickupPoints(v.id, mission.id, points)
+        }
+        return null
+      })
+      .catch(() => {})
+  })
 }
 
 /**
@@ -450,6 +472,84 @@ async function run(action) {
   } catch (e) {
     errorMsg.value = e.message
   }
+}
+
+/** 用高德 POI 检索抓取成都的真实工厂/园区坐标，导入后端 */
+async function importFactoriesFromAmap() {
+  if (!AMap || importing.value) {
+    return
+  }
+  importing.value = true
+  notice.value = ''
+  try {
+    const items = new Map()
+    const keywords = ['工厂', '物流园', '仓库', '产业园']
+    const search = new AMap.PlaceSearch({ city: '成都', citylimit: true, pageSize: 50, extensions: 'base' })
+
+    for (const keyword of keywords) {
+      for (let page = 1; page <= 4; page++) {
+        const result = await new Promise((resolve) => {
+          const handler = (status, res) => resolve(status === 'complete' ? res : null)
+          if (page === 1) {
+            search.search(keyword, handler)
+          } else {
+            search.gotoPage(page, handler)
+          }
+        })
+        const pois = (result && result.poiList && result.poiList.pois) || []
+        if (!pois.length) {
+          break
+        }
+        pois.forEach((p) => {
+          const lng = p.location && p.location.lng
+          const lat = p.location && p.location.lat
+          if (!lng || !lat || !p.name) {
+            return
+          }
+          const key = `${p.name}@${lng.toFixed(4)},${lat.toFixed(4)}`
+          if (items.has(key)) {
+            return
+          }
+          items.set(key, {
+            factoryName: String(p.name).slice(0, 50),
+            address: String(p.address || '').slice(0, 100),
+            phone: String(p.tel || '').slice(0, 20),
+            factoryLongitude: lng,
+            factoryLatitude: lat,
+          })
+        })
+      }
+    }
+
+    const list = [...items.values()]
+    if (!list.length) {
+      notice.value = '没有检索到工厂点位（可能是配额或城市限制）'
+      return
+    }
+    const response = await fetch('/factories/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(list),
+    })
+    const text = await response.text()
+    notice.value = `${text}（检索到 ${list.length} 个点位）`
+    await reloadFactories()
+  } catch (e) {
+    notice.value = `抓取失败：${e.message}`
+  } finally {
+    importing.value = false
+    setTimeout(() => {
+      notice.value = ''
+    }, 6000)
+  }
+}
+
+/** 重新加载工厂点位（先清掉旧标记） */
+async function reloadFactories() {
+  factoryMarkers.forEach((marker) => marker.setMap(null))
+  factoryMarkers.length = 0
+  factoryById.clear()
+  await loadFactories()
 }
 </script>
 
@@ -551,5 +651,9 @@ async function run(action) {
   color: #fff;
   font-size: 13px;
   z-index: 40;
+}
+
+.toast.info {
+  background: rgba(103, 194, 58, 0.95);
 }
 </style>

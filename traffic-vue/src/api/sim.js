@@ -40,6 +40,15 @@ export function updateRoutePoints(routeId, points) {
   }).then(readText)
 }
 
+/** 回写「车辆当前位置 → 装货工厂」的取货段真实折线 */
+export function updatePickupPoints(vehicleId, missionId, points) {
+  return fetch(`/sim/pickup/${vehicleId}/${missionId}/points`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(points),
+  }).then(readText)
+}
+
 export function startSim() {
   return fetch('/sim/start', { method: 'POST' }).then(readText)
 }
