@@ -29,7 +29,7 @@
 <script setup>
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { fetchState, resetSim, startSim, stopSim } from '../api/sim'
+import { fetchRoutePoints, fetchState, resetSim, startSim, stopSim } from '../api/sim'
 import VehiclePanel from './VehiclePanel.vue'
 import TaskPanel from './TaskPanel.vue'
 
@@ -70,6 +70,10 @@ let pollTimer = null
 const factoryById = new Map()
 const vehicleMarkers = new Map()
 const taskLines = new Map()
+/** 路线折线缓存：routeId -> [[lng,lat],...] */
+const routeCache = new Map()
+/** 正在请求中的路线，避免同一路线并发重复请求 */
+const routeLoading = new Map()
 
 onMounted(async () => {
   window._AMapSecurityConfig = { securityJsCode: AMAP_SECURITY_CODE }
@@ -90,6 +94,7 @@ onMounted(async () => {
     await loadFactories()
     await loadState()
     setTimeout(() => map && map.resize(), 200)
+    window.addEventListener('resize', handleResize)
     pollTimer = setInterval(loadState, POLL_INTERVAL)
   } catch (e) {
     errorMsg.value = `地图加载失败：${e.message}`
@@ -101,6 +106,7 @@ onUnmounted(() => {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  window.removeEventListener('resize', handleResize)
   if (map) {
     map.destroy()
     map = null
@@ -108,7 +114,16 @@ onUnmounted(() => {
   factoryById.clear()
   vehicleMarkers.clear()
   taskLines.clear()
+  routeCache.clear()
+  routeLoading.clear()
 })
+
+/** 窗口尺寸变化时让地图重新铺满容器 */
+function handleResize() {
+  if (map) {
+    map.resize()
+  }
+}
 
 /** 工厂点位只加载一次，用 CircleMarker 以支撑 300+ 个点位的渲染性能 */
 async function loadFactories() {
@@ -197,7 +212,7 @@ function renderVehicles(vehicles) {
   })
 }
 
-/** 进行中的任务画一条 起点→终点 的虚线 */
+/** 进行中的任务按数据库里的路线折线绘制；路线还没取到就先画直线占位 */
 function renderTasks(missions) {
   const alive = new Set()
   missions.forEach((m) => {
@@ -207,26 +222,7 @@ function renderTasks(missions) {
       return
     }
     alive.add(m.id)
-    const path = [
-      [from.lng, from.lat],
-      [to.lng, to.lat],
-    ]
-
-    const line = taskLines.get(m.id)
-    if (!line) {
-      const created = new AMap.Polyline({
-        path,
-        strokeColor: '#409EFF',
-        strokeWeight: 3,
-        strokeStyle: 'dashed',
-        strokeOpacity: 0.85,
-        zIndex: 120,
-      })
-      created.setMap(map)
-      taskLines.set(m.id, created)
-    } else {
-      line.setPath(path)
-    }
+    drawTaskLine(m, from, to)
   })
 
   taskLines.forEach((line, id) => {
@@ -235,6 +231,57 @@ function renderTasks(missions) {
       taskLines.delete(id)
     }
   })
+}
+
+async function drawTaskLine(mission, from, to) {
+  let path = [
+    [from.lng, from.lat],
+    [to.lng, to.lat],
+  ]
+  if (mission.routeId) {
+    const points = await loadRoute(mission.routeId)
+    if (points && points.length > 1) {
+      path = points
+    }
+  }
+  if (!map) {
+    return
+  }
+  const line = taskLines.get(mission.id)
+  if (!line) {
+    const created = new AMap.Polyline({
+      path,
+      strokeColor: '#409EFF',
+      strokeWeight: 4,
+      strokeOpacity: 0.85,
+      zIndex: 120,
+    })
+    created.setMap(map)
+    taskLines.set(mission.id, created)
+  } else {
+    line.setPath(path)
+  }
+}
+
+function loadRoute(routeId) {
+  if (routeCache.has(routeId)) {
+    return Promise.resolve(routeCache.get(routeId))
+  }
+  if (routeLoading.has(routeId)) {
+    return routeLoading.get(routeId)
+  }
+  const task = fetchRoutePoints(routeId)
+    .then((points) => {
+      routeCache.set(routeId, points)
+      routeLoading.delete(routeId)
+      return points
+    })
+    .catch(() => {
+      routeLoading.delete(routeId)
+      return null
+    })
+  routeLoading.set(routeId, task)
+  return task
 }
 
 async function run(action) {

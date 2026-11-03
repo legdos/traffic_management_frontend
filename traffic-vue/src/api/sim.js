@@ -21,6 +21,11 @@ export function fetchState() {
   return fetch('/sim/state').then(readJson)
 }
 
+/** 某条路线的折线点 [[lng,lat],...] */
+export function fetchRoutePoints(routeId) {
+  return fetch(`/routes/${routeId}/points`).then(readJson)
+}
+
 export function startSim() {
   return fetch('/sim/start', { method: 'POST' }).then(readText)
 }

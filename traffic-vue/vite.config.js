@@ -42,6 +42,11 @@ export default defineConfig({
         target: BACKEND_TARGET,
         changeOrigin: true,
       },
+      // 路线折线接口转发
+      '/routes': {
+        target: BACKEND_TARGET,
+        changeOrigin: true,
+      },
       // 仿真控制接口转发
       '/sim': {
         target: BACKEND_TARGET,
