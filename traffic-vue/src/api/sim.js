@@ -26,6 +26,20 @@ export function fetchRoutePoints(routeId) {
   return fetch(`/routes/${routeId}/points`).then(readJson)
 }
 
+/** 路线详情，用 roadType 判断是否已经是导航路线 */
+export function fetchRoute(routeId) {
+  return fetch(`/routes/${routeId}`).then(readJson)
+}
+
+/** 把高德 JS API 规划出的真实道路折线回写给后端 */
+export function updateRoutePoints(routeId, points) {
+  return fetch(`/routes/${routeId}/points`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(points),
+  }).then(readText)
+}
+
 export function startSim() {
   return fetch('/sim/start', { method: 'POST' }).then(readText)
 }

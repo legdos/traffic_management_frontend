@@ -29,13 +29,16 @@
 <script setup>
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { fetchRoutePoints, fetchState, resetSim, startSim, stopSim } from '../api/sim'
+import { fetchRoute, fetchRoutePoints, fetchState, resetSim, startSim, stopSim, updateRoutePoints } from '../api/sim'
 import VehiclePanel from './VehiclePanel.vue'
 import TaskPanel from './TaskPanel.vue'
 
 /** 高德地图 key 与安全密钥 */
 const AMAP_KEY = '4fe176fc16d356769714d97913538dce'
 const AMAP_SECURITY_CODE = 'bb2549ae73d47cd79a1a27535a9e8f25'
+
+/** 后端 route.roadType 的取值：表示这条折线是 JS API 规划出的真实道路 */
+const NAVIGATION_ROAD_TYPE = '导航路线'
 
 /** 轮询间隔（毫秒）；后端默认 5 秒一轮 */
 const POLL_INTERVAL = 3000
@@ -81,7 +84,7 @@ onMounted(async () => {
     AMap = await AMapLoader.load({
       key: AMAP_KEY,
       version: '2.0',
-      plugins: ['AMap.Scale', 'AMap.ToolBar'],
+      plugins: ['AMap.Scale', 'AMap.ToolBar', 'AMap.Driving'],
     })
     map = new AMap.Map('map-container', {
       viewMode: '2D',
@@ -239,7 +242,7 @@ async function drawTaskLine(mission, from, to) {
     [to.lng, to.lat],
   ]
   if (mission.routeId) {
-    const points = await loadRoute(mission.routeId)
+    const points = await ensureRouteGeometry(mission.routeId, from, to)
     if (points && points.length > 1) {
       path = points
     }
@@ -263,25 +266,86 @@ async function drawTaskLine(mission, from, to) {
   }
 }
 
-function loadRoute(routeId) {
+/**
+ * 取路线几何：已经是导航路线就直接用库里的折线；
+ * 还是合成路线就用 JS API 规划一次真实道路，并把折线回写给后端，
+ * 这样后续所有走这条线的车辆都会贴着真实道路行驶。
+ */
+function ensureRouteGeometry(routeId, from, to) {
   if (routeCache.has(routeId)) {
     return Promise.resolve(routeCache.get(routeId))
   }
   if (routeLoading.has(routeId)) {
     return routeLoading.get(routeId)
   }
-  const task = fetchRoutePoints(routeId)
-    .then((points) => {
-      routeCache.set(routeId, points)
+
+  const task = (async () => {
+    try {
+      const detail = await fetchRoute(routeId).catch(() => null)
+      if (detail && detail.roadType === NAVIGATION_ROAD_TYPE) {
+        const points = await fetchRoutePoints(routeId).catch(() => [])
+        routeCache.set(routeId, points)
+        return points
+      }
+
+      const planned = await planRoute(from, to)
+      if (planned && planned.length > 1) {
+        try {
+          await updateRoutePoints(routeId, planned)
+          routeCache.set(routeId, planned)
+          return planned
+        } catch (e) {
+          // 回写失败就退回到后端已有的合成折线
+        }
+      }
+
+      const fallback = await fetchRoutePoints(routeId).catch(() => [])
+      routeCache.set(routeId, fallback)
+      return fallback.length > 1 ? fallback : null
+    } finally {
       routeLoading.delete(routeId)
-      return points
-    })
-    .catch(() => {
-      routeLoading.delete(routeId)
-      return null
-    })
+    }
+  })()
+
   routeLoading.set(routeId, task)
   return task
+}
+
+/** 用高德 JS API（与地图同一个 key）规划驾车路线，返回折线点 */
+function planRoute(from, to) {
+  return new Promise((resolve) => {
+    if (!AMap) {
+      resolve(null)
+      return
+    }
+    try {
+      const driving = new AMap.Driving({ policy: 0 })
+      driving.search(
+        new AMap.LngLat(from.lng, from.lat),
+        new AMap.LngLat(to.lng, to.lat),
+        (status, result) => {
+          if (status !== 'complete' || !result || !result.routes || !result.routes.length) {
+            resolve(null)
+            return
+          }
+          const points = []
+          result.routes[0].steps.forEach((step) => {
+            ;(step.path || []).forEach((p) => {
+              const lng = typeof p.getLng === 'function' ? p.getLng() : p.lng
+              const lat = typeof p.getLat === 'function' ? p.getLat() : p.lat
+              const last = points[points.length - 1]
+              if (!last || last[0] !== lng || last[1] !== lat) {
+                points.push([lng, lat])
+              }
+            })
+          })
+          resolve(points.length > 1 ? points : null)
+        },
+      )
+    } catch (e) {
+      resolve(null)
+    }
+  })
 }
 
 async function run(action) {
