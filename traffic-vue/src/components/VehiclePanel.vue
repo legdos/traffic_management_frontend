@@ -6,26 +6,28 @@
     </header>
 
     <ul class="vehicles">
-      <li v-for="v in vehicles" :key="v.id">
+      <li v-for="row in rows" :key="row.vehicle.id">
         <div class="row">
-          <span class="vid">车辆 {{ v.id }}</span>
-          <span class="state" :style="{ color: colorOf(v.currentAction) }">{{ textOf(v.currentAction) }}</span>
-          <span class="rest">剩余 {{ v.remainingTime ?? 0 }} 分</span>
+          <span class="vid">车辆 {{ row.vehicle.id }}</span>
+          <span class="state" :style="{ color: colorOf(row.vehicle.currentAction) }">
+            {{ textOf(row.vehicle.currentAction) }}
+          </span>
+          <span class="rest">本状态剩 {{ row.vehicle.remainingTime ?? 0 }} 分</span>
         </div>
 
-        <div v-if="missionByCar.get(v.id)" class="mission">
+        <div v-if="row.mission" class="mission">
           <div class="row small">
-            <span class="goods">{{ missionByCar.get(v.id).goodsType }}</span>
+            <span class="goods">{{ row.mission.goodsType }}</span>
             <span class="route">
-              {{ nameOf(missionByCar.get(v.id).factoryId) }} → {{ nameOf(missionByCar.get(v.id).destFactoryId) }}
+              {{ nameOf(row.mission.factoryId) }} → {{ nameOf(row.mission.destFactoryId) }}
             </span>
           </div>
           <div class="bar">
-            <i :style="{ width: percent(missionByCar.get(v.id)) }"></i>
+            <i :style="{ width: percent(row.mission) }"></i>
           </div>
           <div class="row tiny">
-            <span>{{ missionByCar.get(v.id).status }}</span>
-            <span>{{ missionByCar.get(v.id).elapsedMinutes ?? 0 }} / {{ missionByCar.get(v.id).totalMinutes ?? 0 }} 分</span>
+            <span>{{ row.mission.status }}</span>
+            <span>任务剩 {{ remainOf(row.mission) }} 分 · 已用 {{ row.mission.elapsedMinutes ?? 0 }} 分</span>
           </div>
         </div>
 
@@ -60,6 +62,32 @@ const missionByCar = computed(() => {
   return map
 })
 
+/** 车辆 + 它当前的任务，模板里直接遍历，避免反复查 Map */
+const rows = computed(() =>
+  props.vehicles.map((vehicle) => ({
+    vehicle,
+    mission: missionByCar.value.get(vehicle.id) || null,
+  })),
+)
+
+/** 任务剩余分钟：后端已按「当前状态剩余 + 后续阶段估算」算好 */
+function remainOf(mission) {
+  const remain = Number(mission.remainMinutes)
+  if (Number.isFinite(remain) && remain >= 0) {
+    return remain
+  }
+  const total = Number(mission.totalMinutes) || 0
+  const elapsed = Number(mission.elapsedMinutes) || 0
+  return Math.max(0, total - elapsed)
+}
+
+function percent(mission) {
+  const elapsed = Number(mission.elapsedMinutes) || 0
+  const total = elapsed + remainOf(mission)
+  if (total <= 0) return '0%'
+  return `${Math.min(100, Math.round((elapsed / total) * 100))}%`
+}
+
 function textOf(actionId) {
   return STATUS_TEXT[actionId] || '未知'
 }
@@ -70,13 +98,6 @@ function colorOf(actionId) {
 
 function nameOf(factoryId) {
   return nameById.value.get(factoryId) || `工厂${factoryId}`
-}
-
-function percent(mission) {
-  const total = Number(mission.totalMinutes) || 0
-  const elapsed = Number(mission.elapsedMinutes) || 0
-  if (total <= 0) return '0%'
-  return `${Math.min(100, Math.round((elapsed / total) * 100))}%`
 }
 </script>
 
