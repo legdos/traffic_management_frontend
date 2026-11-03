@@ -9,9 +9,9 @@
       <span class="badge" :class="state.running ? 'on' : 'off'">
         {{ state.running ? '运行中' : '已停止' }}
       </span>
-      <button :disabled="state.running" @click="run(startSim)">启动仿真</button>
-      <button :disabled="!state.running" @click="run(stopSim)">停止</button>
-      <button class="ghost" @click="run(resetSim)">重置</button>
+      <button v-if="!state.running" @click="run(startSim)">继续</button>
+      <button v-else class="ghost" @click="run(stopSim)">暂停</button>
+      <button class="ghost" @click="resetAndStart">重置</button>
       <button class="ghost" :disabled="importing" @click="importFactoriesFromAmap">
         {{ importing ? '抓取中…' : '抓取真实工厂' }}
       </button>
@@ -131,6 +131,7 @@ onMounted(async () => {
     window.addEventListener('resize', handleResize)
     pollTimer = setInterval(loadState, POLL_INTERVAL)
     rafId = requestAnimationFrame(animate)
+    await ensureAutoStart()
   } catch (e) {
     errorMsg.value = `地图加载失败：${e.message}`
   }
@@ -178,9 +179,22 @@ function animate(timestamp) {
       t = 1
       st.duration = 0
     }
+    const marker = vehicleMarkers.get(id)
+
+    if (st.path && st.cum) {
+      // 沿折线按弧长推进，拐弯处不会切角
+      const s = st.sFrom + (st.sTo - st.sFrom) * t
+      const point = pointAtPath(st.path, st.cum, s)
+      st.curLat = point[0]
+      st.curLng = point[1]
+      if (marker) {
+        marker.setPosition([point[1], point[0]])
+      }
+      return
+    }
+
     st.curLat = st.fromLat + (st.toLat - st.fromLat) * t
     st.curLng = st.fromLng + (st.toLng - st.fromLng) * t
-    const marker = vehicleMarkers.get(id)
     if (marker) {
       marker.setPosition([st.curLng, st.curLat])
     }
@@ -246,6 +260,7 @@ async function loadFactories() {
 async function loadState() {
   try {
     const snapshot = await fetchState()
+    const prevTick = state.tick
     state.running = snapshot.running
     state.tick = snapshot.tick
     state.simMinutes = snapshot.simMinutes
@@ -256,7 +271,9 @@ async function loadState() {
     state.doneMissions = snapshot.doneMissions || []
     errorMsg.value = ''
 
-    renderVehicles(state.vehicles)
+    // 轮次回退或刚重置时，车辆应该直接吸到新位置，不要慢悠悠地飘过去
+    const snap = snapshot.tick <= 1 || snapshot.tick < prevTick
+    renderVehicles(state.vehicles, state.activeMissions, snap)
     planTaskRoutes(state.activeMissions)
     planPickupRoutes(state.vehicles, state.activeMissions)
     renderLegs(state.vehicles, state.activeMissions)
@@ -265,10 +282,16 @@ async function loadState() {
   }
 }
 
-function renderVehicles(vehicles) {
+function renderVehicles(vehicles, missions, snap = false) {
   const alive = new Set()
   const now = performance.now()
   const animMs = Math.max(600, (state.tickSeconds || 5) * 1000)
+  const missionByCar = new Map()
+  missions.forEach((m) => {
+    if (m.carId) {
+      missionByCar.set(m.carId, m)
+    }
+  })
 
   vehicles.forEach((v) => {
     const lng = Number(v.currentLongitude)
@@ -291,12 +314,16 @@ function renderVehicles(vehicles) {
       created.setMap(map)
       vehicleMarkers.set(v.id, created)
       markerState.set(v.id, {
+        curLat: lat,
+        curLng: lng,
         fromLat: lat,
         fromLng: lng,
         toLat: lat,
         toLng: lng,
-        curLat: lat,
-        curLng: lng,
+        path: null,
+        cum: null,
+        sFrom: 0,
+        sTo: 0,
         start: now,
         duration: 0,
       })
@@ -315,16 +342,30 @@ function renderVehicles(vehicles) {
       return
     }
 
-    st.fromLat = st.curLat
-    st.fromLng = st.curLng
-    st.toLat = lat
-    st.toLng = lng
+    // 有当前路段的折线就沿折线按弧长插值，避免在拐弯处走直线弦
+    const path = legPathOf(v, missionByCar.get(v.id))
+    if (path && path.length > 1) {
+      const cum = pathCumulative(path)
+      st.path = path
+      st.cum = cum
+      st.sFrom = projectOnPath(path, cum, st.curLat, st.curLng)
+      st.sTo = projectOnPath(path, cum, lat, lng)
+    } else {
+      st.path = null
+      st.cum = null
+      st.fromLat = st.curLat
+      st.fromLng = st.curLng
+      st.toLat = lat
+      st.toLng = lng
+    }
+
     st.start = now
-    // 距离过大说明是重置/瞬移，直接吸附
-    st.duration = moved > SNAP_KM ? 0 : animMs
+    // 重置/瞬移或手动指定 snap 时直接吸附，不做动画
+    st.duration = snap || moved > SNAP_KM ? 0 : animMs
     if (st.duration === 0) {
       st.curLat = lat
       st.curLng = lng
+      st.sFrom = st.sTo
       marker.setPosition([lng, lat])
     }
   })
@@ -336,6 +377,79 @@ function renderVehicles(vehicles) {
       markerState.delete(id)
     }
   })
+}
+
+/** 车辆当前行驶段的折线：接单段用规划结果，运货段用路线折线 */
+function legPathOf(vehicle, mission) {
+  if (!mission) {
+    return null
+  }
+  const action = Number(vehicle.currentAction)
+  if (action === 2) {
+    return pickupPaths.get(`${vehicle.id}:${mission.id}`) || null
+  }
+  if (action === 4 && mission.routeId) {
+    return routeCache.get(mission.routeId) || null
+  }
+  return null
+}
+
+/** 折线各点到起点的累计弧长（km） */
+function pathCumulative(points) {
+  const cum = [0]
+  for (let i = 1; i < points.length; i++) {
+    cum.push(
+      cum[i - 1] +
+        distanceKm(points[i - 1][1], points[i - 1][0], points[i][1], points[i][0]),
+    )
+  }
+  return cum
+}
+
+/** 把坐标投影到折线上，返回从起点算起的弧长（km） */
+function projectOnPath(points, cum, lat, lng) {
+  let bestDistance = Infinity
+  let bestSeg = 1
+  let bestT = 0
+  const kLng = 111.32 * Math.cos((lat * Math.PI) / 180)
+
+  for (let i = 1; i < points.length; i++) {
+    const ax = (points[i - 1][0] - lng) * kLng
+    const ay = (points[i - 1][1] - lat) * 110.574
+    const bx = (points[i][0] - lng) * kLng
+    const by = (points[i][1] - lat) * 110.574
+    const dx = bx - ax
+    const dy = by - ay
+    const len2 = dx * dx + dy * dy
+    let t = len2 === 0 ? 0 : -(ax * dx + ay * dy) / len2
+    t = Math.max(0, Math.min(1, t))
+    const d = Math.hypot(ax + t * dx, ay + t * dy)
+    if (d < bestDistance) {
+      bestDistance = d
+      bestSeg = i
+      bestT = t
+    }
+  }
+  return cum[bestSeg - 1] + bestT * (cum[bestSeg] - cum[bestSeg - 1])
+}
+
+/** 折线上弧长 s 处的坐标，返回 [lat, lng] */
+function pointAtPath(points, cum, s) {
+  if (s <= 0) {
+    return [points[0][1], points[0][0]]
+  }
+  for (let i = 1; i < points.length; i++) {
+    if (s <= cum[i]) {
+      const segLength = cum[i] - cum[i - 1]
+      const t = segLength <= 0 ? 0 : (s - cum[i - 1]) / segLength
+      return [
+        points[i - 1][1] + (points[i][1] - points[i - 1][1]) * t,
+        points[i - 1][0] + (points[i][0] - points[i - 1][0]) * t,
+      ]
+    }
+  }
+  const last = points[points.length - 1]
+  return [last[1], last[0]]
 }
 
 /** 任务路线只用于规划几何（供后端推进车辆），不再在地图上画线 */
@@ -558,6 +672,27 @@ async function run(action) {
   }
 }
 
+/** 打开页面即自动开始仿真，工具栏只保留「暂停 / 继续」 */
+async function ensureAutoStart() {
+  try {
+    await startSim()
+    await loadState()
+  } catch (e) {
+    errorMsg.value = `自动启动失败：${e.message}`
+  }
+}
+
+/** 重置后立刻重新开始，避免用户还要再点一次继续 */
+async function resetAndStart() {
+  try {
+    await resetSim()
+    await startSim()
+    await loadState()
+  } catch (e) {
+    errorMsg.value = e.message
+  }
+}
+
 /** 用高德 POI 检索抓取成都的真实工厂/园区坐标，导入后端 */
 async function importFactoriesFromAmap() {
   if (!AMap || importing.value) {
@@ -570,15 +705,18 @@ async function importFactoriesFromAmap() {
     const keywords = ['工厂', '物流园', '仓库', '产业园']
     const search = new AMap.PlaceSearch({ city: '成都', citylimit: true, pageSize: 50, extensions: 'base' })
 
+    // JS API 2.0 的 PlaceSearch 没有 gotoPage，翻页要先 setPageIndex 再 search
+    const pageable = typeof search.setPageIndex === 'function'
+    const pages = pageable ? 4 : 1
+
     for (const keyword of keywords) {
-      for (let page = 1; page <= 4; page++) {
+      for (let page = 1; page <= pages; page++) {
+        if (page > 1) {
+          search.setPageIndex(page)
+        }
         const result = await new Promise((resolve) => {
           const handler = (status, res) => resolve(status === 'complete' ? res : null)
-          if (page === 1) {
-            search.search(keyword, handler)
-          } else {
-            search.gotoPage(page, handler)
-          }
+          search.search(keyword, handler)
         })
         const pois = (result && result.poiList && result.poiList.pois) || []
         if (!pois.length) {
