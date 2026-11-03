@@ -98,6 +98,10 @@ const factoryMarkers = []
 const markerState = new Map()
 /** 已规划过取货路线的「车辆:任务」，避免重复请求 */
 const pickupPlanned = new Set()
+/** 已规划出的取货段折线 */
+const pickupPaths = new Map()
+/** 每辆车当前行驶段的路线高亮：vehicleId -> Polyline */
+const legLines = new Map()
 let rafId = null
 let lastFrame = 0
 /** 路线折线缓存：routeId -> [[lng,lat],...] */
@@ -111,7 +115,7 @@ onMounted(async () => {
     AMap = await AMapLoader.load({
       key: AMAP_KEY,
       version: '2.0',
-      plugins: ['AMap.Scale', 'AMap.ToolBar', 'AMap.Driving'],
+      plugins: ['AMap.Scale', 'AMap.ToolBar', 'AMap.Driving', 'AMap.PlaceSearch'],
     })
     map = new AMap.Map('map-container', {
       viewMode: '2D',
@@ -151,6 +155,8 @@ onUnmounted(() => {
   factoryMarkers.length = 0
   markerState.clear()
   pickupPlanned.clear()
+  pickupPaths.clear()
+  legLines.clear()
   routeCache.clear()
   routeLoading.clear()
 })
@@ -253,6 +259,7 @@ async function loadState() {
     renderVehicles(state.vehicles)
     planTaskRoutes(state.activeMissions)
     planPickupRoutes(state.vehicles, state.activeMissions)
+    renderLegs(state.vehicles, state.activeMissions)
   } catch (e) {
     errorMsg.value = `获取仿真状态失败：${e.message}（后端是否已启动？）`
   }
@@ -374,11 +381,88 @@ function planPickupRoutes(vehicles, missions) {
     planRoute(from, target)
       .then((points) => {
         if (points && points.length > 1) {
+          pickupPaths.set(key, points)
           return updatePickupPoints(v.id, mission.id, points)
         }
         return null
       })
       .catch(() => {})
+  })
+}
+
+/**
+ * 高亮每辆车当前正在行驶的那一段路线（接单段 / 运货段），带方向箭头。
+ * 没拿到真实折线时先用直线占位，下一轮拿到后再替换。
+ */
+function renderLegs(vehicles, missions) {
+  const missionByCar = new Map()
+  missions.forEach((m) => {
+    if (m.carId) {
+      missionByCar.set(m.carId, m)
+    }
+  })
+
+  const alive = new Set()
+  vehicles.forEach((v) => {
+    const action = Number(v.currentAction)
+    const mission = missionByCar.get(v.id)
+    let path = null
+
+    if (action === 2 && mission) {
+      // 接单行驶：车辆当前位置 → 装货工厂
+      const planned = pickupPaths.get(`${v.id}:${mission.id}`)
+      const origin = factoryById.get(mission.factoryId)
+      if (planned && planned.length > 1) {
+        path = planned
+      } else if (origin) {
+        path = [
+          [Number(v.currentLongitude), Number(v.currentLatitude)],
+          [origin.lng, origin.lat],
+        ]
+      }
+    } else if (action === 4 && mission && mission.routeId) {
+      // 运货行驶：沿任务路线的折线
+      const cached = routeCache.get(mission.routeId)
+      const from = factoryById.get(mission.factoryId)
+      const to = factoryById.get(mission.destFactoryId)
+      if (cached && cached.length > 1) {
+        path = cached
+      } else if (from && to) {
+        path = [
+          [from.lng, from.lat],
+          [to.lng, to.lat],
+        ]
+      }
+    }
+
+    if (!path) {
+      return
+    }
+    alive.add(v.id)
+
+    const line = legLines.get(v.id)
+    if (!line) {
+      const created = new AMap.Polyline({
+        path,
+        strokeColor: '#1d6fd8',
+        strokeWeight: 5,
+        strokeOpacity: 0.55,
+        lineJoin: 'round',
+        showDir: true,
+        zIndex: 90,
+      })
+      created.setMap(map)
+      legLines.set(v.id, created)
+    } else {
+      line.setPath(path)
+    }
+  })
+
+  legLines.forEach((line, id) => {
+    if (!alive.has(id)) {
+      line.setMap(null)
+      legLines.delete(id)
+    }
   })
 }
 
