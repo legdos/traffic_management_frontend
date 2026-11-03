@@ -40,8 +40,11 @@ const AMAP_SECURITY_CODE = 'bb2549ae73d47cd79a1a27535a9e8f25'
 /** 后端 route.roadType 的取值：表示这条折线是 JS API 规划出的真实道路 */
 const NAVIGATION_ROAD_TYPE = '导航路线'
 
-/** 轮询间隔（毫秒）；后端默认 5 秒一轮 */
-const POLL_INTERVAL = 3000
+/** 轮询间隔（毫秒）：后端 tick 时位置会变，前端按 tickSeconds 做插值，所以可以频繁拉取 */
+const POLL_INTERVAL = 1000
+
+/** 位移超过这个距离（km）就不做动画，直接吸附（例如重置、瞬移） */
+const SNAP_KM = 30
 
 const STATUS_COLOR = {
   1: '#909399',
@@ -57,6 +60,8 @@ const state = reactive({
   running: false,
   tick: 0,
   simMinutes: 0,
+  /** 后端每轮的真实秒数，前端用它作为位移动画时长 */
+  tickSeconds: 5,
   vehicles: [],
   pendingMissions: [],
   activeMissions: [],
@@ -73,6 +78,10 @@ let pollTimer = null
 const factoryById = new Map()
 const vehicleMarkers = new Map()
 const taskLines = new Map()
+/** 每辆车的动画状态：当前插值位置 + 目标位置 */
+const markerState = new Map()
+let rafId = null
+let lastFrame = 0
 /** 路线折线缓存：routeId -> [[lng,lat],...] */
 const routeCache = new Map()
 /** 正在请求中的路线，避免同一路线并发重复请求 */
@@ -99,6 +108,7 @@ onMounted(async () => {
     setTimeout(() => map && map.resize(), 200)
     window.addEventListener('resize', handleResize)
     pollTimer = setInterval(loadState, POLL_INTERVAL)
+    rafId = requestAnimationFrame(animate)
   } catch (e) {
     errorMsg.value = `地图加载失败：${e.message}`
   }
@@ -109,6 +119,10 @@ onUnmounted(() => {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  if (rafId) {
+    cancelAnimationFrame(rafId)
+    rafId = null
+  }
   window.removeEventListener('resize', handleResize)
   if (map) {
     map.destroy()
@@ -117,9 +131,47 @@ onUnmounted(() => {
   factoryById.clear()
   vehicleMarkers.clear()
   taskLines.clear()
+  markerState.clear()
   routeCache.clear()
   routeLoading.clear()
 })
+
+/** 每帧把车辆标记朝目标点插值推进，形成平滑移动 */
+function animate(timestamp) {
+  rafId = requestAnimationFrame(animate)
+  if (timestamp - lastFrame < 40) {
+    return
+  }
+  lastFrame = timestamp
+
+  markerState.forEach((st, id) => {
+    if (st.duration <= 0) {
+      return
+    }
+    let t = (timestamp - st.start) / st.duration
+    if (t >= 1) {
+      t = 1
+      st.duration = 0
+    }
+    st.curLat = st.fromLat + (st.toLat - st.fromLat) * t
+    st.curLng = st.fromLng + (st.toLng - st.fromLng) * t
+    const marker = vehicleMarkers.get(id)
+    if (marker) {
+      marker.setPosition([st.curLng, st.curLat])
+    }
+  })
+}
+
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const R = 6371
+  const rad = Math.PI / 180
+  const dLat = (lat2 - lat1) * rad
+  const dLng = (lng2 - lng1) * rad
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLng / 2) * Math.sin(dLng / 2)
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)))
+}
 
 /** 窗口尺寸变化时让地图重新铺满容器 */
 function handleResize() {
@@ -163,6 +215,7 @@ async function loadState() {
     state.running = snapshot.running
     state.tick = snapshot.tick
     state.simMinutes = snapshot.simMinutes
+    state.tickSeconds = snapshot.tickSeconds || 5
     state.vehicles = snapshot.vehicles || []
     state.pendingMissions = snapshot.pendingMissions || []
     state.activeMissions = snapshot.activeMissions || []
@@ -181,6 +234,9 @@ async function loadState() {
 
 function renderVehicles(vehicles) {
   const alive = new Set()
+  const now = performance.now()
+  const animMs = Math.max(600, (state.tickSeconds || 5) * 1000)
+
   vehicles.forEach((v) => {
     const lng = Number(v.currentLongitude)
     const lat = Number(v.currentLatitude)
@@ -201,9 +257,42 @@ function renderVehicles(vehicles) {
       })
       created.setMap(map)
       vehicleMarkers.set(v.id, created)
-    } else {
+      markerState.set(v.id, {
+        fromLat: lat,
+        fromLng: lng,
+        toLat: lat,
+        toLng: lng,
+        curLat: lat,
+        curLng: lng,
+        start: now,
+        duration: 0,
+      })
+      return
+    }
+
+    marker.setContent(html)
+
+    const st = markerState.get(v.id)
+    if (!st) {
+      return
+    }
+    const moved = distanceKm(st.curLat, st.curLng, lat, lng)
+    if (moved < 0.005) {
+      // 这一轮车辆没动（装货/卸货/等待），保持当前动画即可
+      return
+    }
+
+    st.fromLat = st.curLat
+    st.fromLng = st.curLng
+    st.toLat = lat
+    st.toLng = lng
+    st.start = now
+    // 距离过大说明是重置/瞬移，直接吸附
+    st.duration = moved > SNAP_KM ? 0 : animMs
+    if (st.duration === 0) {
+      st.curLat = lat
+      st.curLng = lng
       marker.setPosition([lng, lat])
-      marker.setContent(html)
     }
   })
 
@@ -211,6 +300,7 @@ function renderVehicles(vehicles) {
     if (!alive.has(id)) {
       marker.setMap(null)
       vehicleMarkers.delete(id)
+      markerState.delete(id)
     }
   })
 }
