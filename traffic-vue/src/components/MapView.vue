@@ -1,209 +1,350 @@
 <template>
-  <div>
-    <!-- 马表控制与信息 -->
-    <div class="sim-panel">
-      <span>马表循环: 第 {{ tickCount }} 次</span>
-      <button @click="startSim">启动仿真</button>
-      <button @click="stopSim">停止</button>
+  <div class="sim-page">
+    <div id="map-container"></div>
+
+    <!-- 顶部控制条 -->
+    <div class="toolbar">
+      <span class="item">第 <b>{{ state.tick }}</b> 轮</span>
+      <span class="item">仿真 <b>{{ state.simMinutes }}</b> 分钟</span>
+      <span class="badge" :class="state.running ? 'on' : 'off'">
+        {{ state.running ? '运行中' : '已停止' }}
+      </span>
+      <button :disabled="state.running" @click="run(startSim)">启动仿真</button>
+      <button :disabled="!state.running" @click="run(stopSim)">停止</button>
+      <button class="ghost" @click="run(resetSim)">重置</button>
     </div>
 
-    <!-- 左侧车辆列表 -->
-    <div class="vehicle-list">
-      <h3>车辆状态</h3>
-      <div v-for="v in vehicles" :key="v.id" class="vehicle-item">
-        <span>车辆{{ v.id }}</span>
-        <span :class="'status-' + v.currentAction">{{ statusMap[v.currentAction] || '未知' }}</span>
-        <span>剩余: {{ v.remainingTime }}分钟</span>
-      </div>
-    </div>
+    <VehiclePanel :vehicles="state.vehicles" :missions="state.activeMissions" :factories="factories" />
+    <TaskPanel
+      :pending="state.pendingMissions"
+      :active="state.activeMissions"
+      :done="state.doneMissions"
+      :factories="factories"
+    />
 
-    <div id="map-container" style="width: 100%; height: 100vh;"></div>
+    <div v-if="errorMsg" class="toast">{{ errorMsg }}</div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue';
-import AMapLoader from '@amap/amap-jsapi-loader';
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import AMapLoader from '@amap/amap-jsapi-loader'
+import { fetchState, resetSim, startSim, stopSim } from '../api/sim'
+import VehiclePanel from './VehiclePanel.vue'
+import TaskPanel from './TaskPanel.vue'
 
-let map = null;
-let AMap = null;
-const tickCount = ref(0);
-const vehicles = ref([]);
-let simTimer = null;
+/** 高德地图 key 与安全密钥 */
+const AMAP_KEY = '4fe176fc16d356769714d97913538dce'
+const AMAP_SECURITY_CODE = 'bb2549ae73d47cd79a1a27535a9e8f25'
 
-const statusMap = {
-  1: '空闲', 2: '接单行驶', 3: '装货',
-  4: '运货行驶', 5: '卸货', 6: '等待', 7: '初始化'
-};
+/** 轮询间隔（毫秒）；后端默认 5 秒一轮 */
+const POLL_INTERVAL = 3000
 
-onMounted(() => {
-  window._AMapSecurityConfig = {
-    securityJsCode: 'bb2549ae73d47cd79a1a27535a9e8f25',
-  };
-  
-  AMapLoader.load({
-    key: '4fe176fc16d356769714d97913538dce',
-    version: '2.0',
-    plugins: ['AMap.Scale', 'AMap.ToolBar']
-  }).then((_AMap) => {
-    AMap = _AMap;
+const STATUS_COLOR = {
+  1: '#909399',
+  2: '#409EFF',
+  3: '#E6A23C',
+  4: '#67C23A',
+  5: '#F56C6C',
+  6: '#B37FEB',
+  7: '#606266',
+}
+
+const state = reactive({
+  running: false,
+  tick: 0,
+  simMinutes: 0,
+  vehicles: [],
+  pendingMissions: [],
+  activeMissions: [],
+  doneMissions: [],
+})
+
+const factories = ref([])
+const errorMsg = ref('')
+
+let map = null
+let AMap = null
+let pollTimer = null
+
+const factoryById = new Map()
+const vehicleMarkers = new Map()
+const taskLines = new Map()
+
+onMounted(async () => {
+  window._AMapSecurityConfig = { securityJsCode: AMAP_SECURITY_CODE }
+  try {
+    AMap = await AMapLoader.load({
+      key: AMAP_KEY,
+      version: '2.0',
+      plugins: ['AMap.Scale', 'AMap.ToolBar'],
+    })
     map = new AMap.Map('map-container', {
       viewMode: '2D',
       zoom: 12,
       center: [104.0668, 30.5728],
-    });
-    map.addControl(new AMap.Scale());
-    map.addControl(new AMap.ToolBar());
-    
-    // 延迟 resize 确保地图容器渲染完毕
-    setTimeout(() => map.resize(), 200);
-    
-    // 加载工厂
-    loadFactories();
-    // 加载车辆列表
-    loadVehicles();
-  }).catch(e => {
-    console.error('高德地图加载失败:', e);
-  });
-});
-
-function loadFactories() {
-  fetch('/factories')
-    .then(r => r.json())
-    .then(data => {
-      console.log('工厂数据:', data);
-      data.forEach(f => {
-        const marker = new AMap.Marker({
-          position: [f.factoryLongitude, f.factoryLatitude],
-          title: f.factoryName,
-          label: { content: f.factoryName, direction: 'top' }
-        });
-        marker.setMap(map);
-      });
-      if (data.length) map.setFitView();
     })
-    .catch(err => console.error('加载工厂失败:', err));
+    map.addControl(new AMap.Scale())
+    map.addControl(new AMap.ToolBar())
+
+    await loadFactories()
+    await loadState()
+    setTimeout(() => map && map.resize(), 200)
+    pollTimer = setInterval(loadState, POLL_INTERVAL)
+  } catch (e) {
+    errorMsg.value = `地图加载失败：${e.message}`
+  }
+})
+
+onUnmounted(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+  if (map) {
+    map.destroy()
+    map = null
+  }
+  factoryById.clear()
+  vehicleMarkers.clear()
+  taskLines.clear()
+})
+
+/** 工厂点位只加载一次，用 CircleMarker 以支撑 300+ 个点位的渲染性能 */
+async function loadFactories() {
+  const response = await fetch('/factories')
+  if (!response.ok) {
+    throw new Error(`工厂接口 HTTP ${response.status}`)
+  }
+  const list = await response.json()
+  factories.value = list
+
+  list.forEach((f) => {
+    const lng = Number(f.factoryLongitude)
+    const lat = Number(f.factoryLatitude)
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+      return
+    }
+    factoryById.set(f.id, { id: f.id, name: f.factoryName, lng, lat })
+    const dot = new AMap.CircleMarker({
+      center: [lng, lat],
+      radius: 4,
+      strokeColor: '#1d6fd8',
+      strokeWeight: 1,
+      fillColor: '#409EFF',
+      fillOpacity: 0.7,
+      zIndex: 50,
+    })
+    dot.setMap(map)
+  })
 }
 
-function loadVehicles() {
-  fetch('/vehicles')
-    .then(r => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const ct = r.headers.get('content-type');
-      if (ct && !ct.includes('application/json')) {
-        throw new Error('返回非JSON，请检查后端/代理');
-      }
-      return r.json();
-    })
-    .then(data => {
-      console.log('车辆数据:', data);
-      
-      // 新增：用于收集有效车辆数据，供左侧列表使用
-      const validVehicles = [];
-      
-      data.forEach(v => {
-        console.log('车辆原始数据:', v);
+async function loadState() {
+  try {
+    const snapshot = await fetchState()
+    state.running = snapshot.running
+    state.tick = snapshot.tick
+    state.simMinutes = snapshot.simMinutes
+    state.vehicles = snapshot.vehicles || []
+    state.pendingMissions = snapshot.pendingMissions || []
+    state.activeMissions = snapshot.activeMissions || []
+    state.doneMissions = snapshot.doneMissions || []
+    errorMsg.value = ''
 
-        const lng = Number(v.currentLongitude);
-        const lat = Number(v.currentLatitude);
-
-        if (isNaN(lng) || isNaN(lat)) {
-          console.warn('跳过无效坐标车辆:', v.id);
-          return;
-        }
-
-        // 地图标记（保持原有代码不变）
-        const marker = new AMap.Marker({
-          position: [lng, lat],
-          zIndex: 999,
-          content: `<div style="background:#d9534f;color:white;padding:2px 8px;border-radius:12px;font-size:12px;box-shadow:0 2px 4px rgba(0,0,0,0.3);">🚗${v.id}</div>`,
-          offset: new AMap.Pixel(-20, -10)
-        });
-        marker.setMap(map);
-
-        // 新增：收集有效车辆数据
-        validVehicles.push({
-          id: v.id || v.bandName,
-          currentAction: v.currentAction || 1,
-          remainingTime: v.remainingTime || 0
-        });
-      });
-
-      // 新增：更新左侧列表
-      vehicles.value = validVehicles;
-
-      if (data.length) map.setFitView();
-    })
-    .catch(err => console.error('加载车辆失败:', err));
-}
-
-function startSim() {
-  fetch('/sim/start', { method: 'POST' });
-  loadVehicles();
-  if (simTimer) clearInterval(simTimer);
-  simTimer = setInterval(() => {
-    tickCount.value++;
-    loadVehicles();
-  }, 3000);
-}
-
-function stopSim() {
-  fetch('/sim/stop', { method: 'POST' });
-  if (simTimer) {
-    clearInterval(simTimer);
-    simTimer = null;
+    renderVehicles(state.vehicles)
+    renderTasks(state.activeMissions)
+    if (state.tick === 1 && map) {
+      map.setFitView()
+    }
+  } catch (e) {
+    errorMsg.value = `获取仿真状态失败：${e.message}（后端是否已启动？）`
   }
 }
 
-onUnmounted(() => {
-  stopSim();
-  if (map) map.destroy();
-});
+function renderVehicles(vehicles) {
+  const alive = new Set()
+  vehicles.forEach((v) => {
+    const lng = Number(v.currentLongitude)
+    const lat = Number(v.currentLatitude)
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+      return
+    }
+    alive.add(v.id)
+    const color = STATUS_COLOR[v.currentAction] || '#909399'
+    const html = `<div class="veh-marker" style="border-color:${color};color:${color}">🚚 ${v.id}</div>`
+
+    const marker = vehicleMarkers.get(v.id)
+    if (!marker) {
+      const created = new AMap.Marker({
+        position: [lng, lat],
+        content: html,
+        offset: new AMap.Pixel(-24, -14),
+        zIndex: 300,
+      })
+      created.setMap(map)
+      vehicleMarkers.set(v.id, created)
+    } else {
+      marker.setPosition([lng, lat])
+      marker.setContent(html)
+    }
+  })
+
+  vehicleMarkers.forEach((marker, id) => {
+    if (!alive.has(id)) {
+      marker.setMap(null)
+      vehicleMarkers.delete(id)
+    }
+  })
+}
+
+/** 进行中的任务画一条 起点→终点 的虚线 */
+function renderTasks(missions) {
+  const alive = new Set()
+  missions.forEach((m) => {
+    const from = factoryById.get(m.factoryId)
+    const to = factoryById.get(m.destFactoryId)
+    if (!from || !to) {
+      return
+    }
+    alive.add(m.id)
+    const path = [
+      [from.lng, from.lat],
+      [to.lng, to.lat],
+    ]
+
+    const line = taskLines.get(m.id)
+    if (!line) {
+      const created = new AMap.Polyline({
+        path,
+        strokeColor: '#409EFF',
+        strokeWeight: 3,
+        strokeStyle: 'dashed',
+        strokeOpacity: 0.85,
+        zIndex: 120,
+      })
+      created.setMap(map)
+      taskLines.set(m.id, created)
+    } else {
+      line.setPath(path)
+    }
+  })
+
+  taskLines.forEach((line, id) => {
+    if (!alive.has(id)) {
+      line.setMap(null)
+      taskLines.delete(id)
+    }
+  })
+}
+
+async function run(action) {
+  try {
+    await action()
+    await loadState()
+    errorMsg.value = ''
+  } catch (e) {
+    errorMsg.value = e.message
+  }
+}
 </script>
 
-<style scoped>
-#map-container {
+<style>
+.sim-page {
+  position: relative;
   width: 100vw;
   height: 100vh;
-  position: fixed;
-  top: 0;
-  left: 0;
-  background: #eee;
-  z-index: 1;
+  overflow: hidden;
 }
-.sim-panel {
+
+#map-container {
+  width: 100%;
+  height: 100%;
+  background: #eef1f5;
+}
+
+/* 车辆标记（由 AMap 直接插入 DOM，不能用 scoped） */
+.veh-marker {
+  padding: 2px 8px;
+  border: 2px solid #409eff;
+  border-radius: 12px;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.toolbar {
   position: absolute;
-  top: 20px;
-  left: 220px;
-  z-index: 10;
-  background: rgba(255,255,255,0.9);
-  padding: 10px 15px;
-  border-radius: 6px;
-}
-.vehicle-list {
-  position: absolute;
-  top: 70px;
-  left: 20px;
-  z-index: 10;
-  background: rgba(255,255,255,0.95);
-  padding: 10px;
-  border-radius: 6px;
-  min-width: 180px;
-  max-height: 75vh;
-  overflow-y: auto;
-}
-.vehicle-item {
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
-  gap: 8px;
-  padding: 4px 0;
-  border-bottom: 1px solid #eee;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.96);
+  border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
   font-size: 13px;
+  color: #303133;
+  z-index: 30;
 }
-.status-1 { color: green; }
-.status-2 { color: blue; }
-.status-3 { color: orange; }
-.status-4 { color: purple; }
-.status-5 { color: red; }
-.status-6 { color: gray; }
-.status-7 { color: black; }
+
+.toolbar .item b {
+  color: #409eff;
+  font-size: 15px;
+  margin: 0 2px;
+}
+
+.badge {
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.badge.on {
+  background: #f0f9eb;
+  color: #67c23a;
+}
+
+.badge.off {
+  background: #f4f4f5;
+  color: #909399;
+}
+
+.toolbar button {
+  padding: 4px 12px;
+  border: 1px solid #409eff;
+  border-radius: 6px;
+  background: #409eff;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.toolbar button.ghost {
+  background: #fff;
+  color: #409eff;
+}
+
+.toolbar button:disabled {
+  border-color: #dcdfe6;
+  background: #f5f7fa;
+  color: #c0c4cc;
+  cursor: not-allowed;
+}
+
+.toast {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 16px;
+  border-radius: 8px;
+  background: rgba(245, 108, 108, 0.95);
+  color: #fff;
+  font-size: 13px;
+  z-index: 40;
+}
 </style>
